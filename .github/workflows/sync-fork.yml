@@ -5,11 +5,8 @@ on:
     # 每 6 小时自动同步一次
     - cron: "17 */6 * * *"
 
-  # 允许手动运行，方便测试
+  # 允许手动运行
   workflow_dispatch:
-
-permissions:
-  contents: write
 
 jobs:
   sync:
@@ -18,7 +15,7 @@ jobs:
     steps:
       - name: Sync main with upstream
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.REA_SYNC_TOKEN }}
 
         run: |
           curl --fail-with-body -L \
