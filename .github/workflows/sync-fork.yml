@@ -1,0 +1,30 @@
+name: Sync fork
+
+on:
+  schedule:
+    # 每 6 小时自动同步一次
+    - cron: "17 */6 * * *"
+
+  # 允许手动运行，方便测试
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Sync main with upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+        run: |
+          curl --fail-with-body -L \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "https://api.github.com/repos/${{ github.repository }}/merge-upstream" \
+            -d '{"branch":"main"}'
