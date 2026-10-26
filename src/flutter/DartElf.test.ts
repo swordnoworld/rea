@@ -40,11 +40,16 @@ const imageWithSections = (): Buffer => {
 };
 
 /** The same layout without section headers: symbols live in PT_DYNAMIC. */
-const strippedImageWithSections = (): Buffer => {
-  const elf = buildStrippedElf64Image([
-    { name: "_kDartVmSnapshotData", value: 0x400, size: 52 },
-    { name: "_kDartIsolateSnapshotData", value: 0x800, size: 52 },
-  ]);
+const strippedImageWithSections = (
+  extraDynamicEntries: ReadonlyArray<readonly [number, bigint]> = [],
+): Buffer => {
+  const elf = buildStrippedElf64Image(
+    [
+      { name: "_kDartVmSnapshotData", value: 0x400, size: 52 },
+      { name: "_kDartIsolateSnapshotData", value: 0x800, size: 52 },
+    ],
+    extraDynamicEntries,
+  );
   const section = snapshotSection(GALLERY_HASH);
   return Buffer.concat([
     elf,
@@ -89,6 +94,38 @@ describe("readElfSymbol", () => {
     expect(header.magicValid).toBe(true);
     expect(header.kind).toBe(3);
   });
+
+  it.each([
+    [16, "DT_SYMBOLIC"],
+    [22, "DT_TEXTREL"],
+    [24, "DT_BIND_NOW"],
+  ] as const)(
+    "ignores the payload of %s (%s) without losing symbols",
+    async (tag, _name) => {
+      const names = ["_kDartVmSnapshotData", "_kDartIsolateSnapshotData"];
+      const control = await readElfSymbols(
+        strippedImageWithSections([[tag, 0n]]),
+        names,
+      );
+      expect(control.failures).toEqual([]);
+      expect(control.symbols).toHaveLength(2);
+      const image = strippedImageWithSections([[tag, 0xffffffffffffffffn]]);
+      const original = Buffer.from(image);
+      expect(await readElfSymbols(image, names)).toEqual(control);
+      expect(Buffer.compare(image, original)).toBe(0);
+    },
+  );
+
+  it.each([4, 5, 6, 10, 11, 0x6ffffef5])(
+    "keeps representability checks for consumed dynamic tag %s",
+    async (tag) => {
+      const image = strippedImageWithSections([[tag, 0xffffffffffffffffn]]);
+      expect(await readElfSymbols(image, ["_kDartVmSnapshotData"])).toEqual({
+        symbols: [],
+        failures: [{ reason: "Dynamic entry is not representable" }],
+      });
+    },
+  );
 
   it("refuses a stripped image whose PT_DYNAMIC carries no symbols", async () => {
     // Drop the PT_DYNAMIC program header by leaving only PT_LOAD.
@@ -142,6 +179,53 @@ describe("readElfSymbol", () => {
       }
     },
   );
+});
+
+describe("dynamic symbols without a SHT_DYNSYM section", () => {
+  it.each([false, true])(
+    "uses PT_DYNAMIC with a retained directory (data sections: %s)",
+    async (retainDataSections) => {
+      const original = strippedImageWithSections();
+      const image = appendElfRanges(
+        original,
+        "section",
+        retainDataSections
+          ? [
+              { type: 1, offset: 0x400, size: 52 },
+              { type: 1, offset: 0x800, size: 52 },
+            ]
+          : [],
+      );
+      const names = ["_kDartVmSnapshotData", "_kDartIsolateSnapshotData"];
+      const control = await readElfSymbols(original, names);
+      expect(control.failures).toEqual([]);
+      expect(control.symbols).toHaveLength(2);
+      const before = Buffer.from(image);
+      expect(await readElfSymbols(image, names)).toEqual(control);
+      expect(Buffer.compare(image, before)).toBe(0);
+    },
+  );
+
+  it("keeps malformed present dynsym sections as failures despite usable PT_DYNAMIC", async () => {
+    const image = appendElfRanges(strippedImageWithSections(), "section", [
+      { type: 11, offset: 0, size: 0 },
+    ]);
+    expect(await readElfSymbols(image, ["_kDartVmSnapshotData"])).toEqual({
+      symbols: [],
+      failures: [{ reason: "Dynamic symbol table is malformed" }],
+    });
+  });
+
+  it("keeps bounded dynamic metadata requirements with a retained directory", async () => {
+    const image = appendElfRanges(strippedImageWithSections(), "section", []);
+    // The first entry is DT_SYMTAB, whose address must remain representable.
+    const dynamic = Number(image.readBigUInt64LE(64 + 56 + 8));
+    image.writeBigUInt64LE(0xffffffffffffffffn, dynamic + 8);
+    expect(await readElfSymbols(image, ["_kDartVmSnapshotData"])).toEqual({
+      symbols: [],
+      failures: [{ reason: "Dynamic entry is not representable" }],
+    });
+  });
 });
 
 describe("ELF symbol-table ownership", () => {
@@ -416,5 +500,48 @@ describe("readSnapshotHeader", () => {
       hash: null,
       complete: false,
     });
+  });
+});
+
+it("keeps section admission ahead of program admission for unrepresentable raw offsets", async () => {
+  const bytes = buildStrippedElf64Image([]);
+  bytes.writeBigUInt64LE(0xffffffffffffffffn, 0x28);
+  bytes.writeBigUInt64LE(0xffffffffffffffffn, 0x20);
+  expect(await readElfSymbols(bytes, ["_kDartVmSnapshotData"])).toEqual({
+    symbols: [],
+    failures: [
+      { reason: "ELF section header table is missing or out of bounds" },
+    ],
+  });
+  bytes.writeBigUInt64LE(0n, 0x28);
+  expect(await readElfSymbols(bytes, ["_kDartVmSnapshotData"])).toEqual({
+    symbols: [],
+    failures: [
+      { reason: "ELF program header table is missing or out of bounds" },
+    ],
+  });
+});
+
+it("checks raw symbol precision only after definition and requested-name selection", async () => {
+  const bytes = buildElf64Image([
+    { name: "unselected", value: 64, size: 4 },
+    { name: "selected", value: 64, size: 4 },
+  ]);
+  const expected = await readElfSymbols(bytes, ["selected"]);
+  const sectionTable = Number(bytes.readBigUInt64LE(0x28));
+  const symbols = Number(bytes.readBigUInt64LE(sectionTable + 64 + 0x18));
+  bytes.writeBigUInt64LE(0xffffffffffffffffn, symbols + 8);
+  bytes.writeBigUInt64LE(0xffffffffffffffffn, symbols + 16);
+  expect(await readElfSymbols(bytes, ["selected"])).toEqual(expected);
+  expect(await readElfSymbols(bytes, ["unselected"])).toEqual({
+    symbols: [],
+    failures: [{ reason: "Symbol unselected has unrepresentable bounds" }],
+  });
+  bytes.writeUInt16LE(0, symbols + 6);
+  expect(await readElfSymbols(bytes, ["unselected"])).toEqual({
+    symbols: [],
+    failures: [
+      { reason: "symbol unselected is not in the dynamic symbol table" },
+    ],
   });
 });

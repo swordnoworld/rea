@@ -1,3 +1,5 @@
+import { readElfSymbol } from "../domain/elfSymbol.js";
+import { readElfRawTableDeclarations } from "../domain/elfRawTableDeclarations.js";
 import { Buffer } from "node:buffer";
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import { createElfLoadMap } from "./ElfLoadMap.js";
@@ -14,12 +16,6 @@ class BoundedReader {
 
   u8(offset: number): number | null {
     return offset < this.bytes.length ? this.bytes.readUInt8(offset) : null;
-  }
-
-  u16(offset: number): number | null {
-    return offset + 2 <= this.bytes.length
-      ? this.bytes.readUInt16LE(offset)
-      : null;
   }
 
   u32(offset: number): number | null {
@@ -65,10 +61,12 @@ const PT_DYNAMIC = 2;
 /** Position-independent executable images carry PT_DYNAMIC. */
 const ET_DYN = 3;
 const DT_NULL = 0;
+const DT_HASH = 4;
 const DT_STRTAB = 5;
 const DT_SYMTAB = 6;
 const DT_STRSZ = 10;
 const DT_SYMENT = 11;
+const DT_GNU_HASH = 0x6ffffef5;
 
 /** ELF32 needs 52 bytes, ELF64 needs 64; retain at most this prefix. */
 export const ELF_HEADER_MAX_BYTES = 64;
@@ -82,7 +80,6 @@ export const readElfHeader = (
   bytes: Buffer,
   totalBytes: number = bytes.length,
 ) => {
-  const reader = new BoundedReader(bytes);
   const fixedHeader = readElfFixedHeader(bytes, totalBytes);
   if (!fixedHeader.ok) return { failure: { reason: fixedHeader.error } };
   const is64 = fixedHeader.value.elfClass === 64;
@@ -91,41 +88,47 @@ export const readElfHeader = (
     return { failure: { reason: "unsupported ELF byte order" } };
   if (fixedHeader.value.headerSize !== headerBytes)
     return { failure: { reason: "unsupported ELF header size" } };
-  const e_type = reader.u16(0x10);
+  const e_type = fixedHeader.value.type;
   if (e_type !== 1 && e_type !== 2 && e_type !== ET_DYN)
     return { failure: { reason: "unsupported ELF type" } };
-  const e_shoff = is64 ? reader.u64(0x28) : reader.u32(0x20);
-  const e_shentsize = reader.u16(is64 ? 0x3a : 0x2e);
-  const e_shnum = reader.u16(is64 ? 0x3c : 0x30);
-  const e_phoff = is64 ? reader.u64(0x20) : reader.u32(0x1c);
-  const e_phentsize = reader.u16(is64 ? 0x36 : 0x2a);
-  const e_phnum = reader.u16(is64 ? 0x38 : 0x2c);
+  const raw = readElfRawTableDeclarations(bytes, fixedHeader.value);
+  if (!raw.ok) return { failure: { reason: raw.error.message } };
+  const { programs, sections } = raw.value;
+  const e_shoff =
+    sections.offset <= BigInt(Number.MAX_SAFE_INTEGER)
+      ? Number(sections.offset)
+      : null;
+  const e_shentsize = sections.width;
+  const e_shnum = sections.count;
+  const e_phoff =
+    programs.offset <= BigInt(Number.MAX_SAFE_INTEGER)
+      ? Number(programs.offset)
+      : null;
+  const e_phentsize = programs.width;
+  const e_phnum = programs.count;
   const tableFits = (
     offset: number | null,
-    width: number | null,
-    count: number | null,
+    width: number,
+    count: number,
     minimumWidth: number,
   ): boolean =>
     offset !== null &&
-    width !== null &&
-    count !== null &&
     offset >= headerBytes &&
     offset <= totalBytes &&
     width >= minimumWidth &&
     count > 0 &&
     count <= Math.floor((totalBytes - offset) / width);
   const MIN_SHENT = is64 ? 64 : 40;
-  // Section-stripped ET_DYN images keep their exported symbols reachable
-  // through PT_DYNAMIC instead of section headers; every other shape still
-  // needs a usable section header table.
+  // Section-stripped ET_DYN images may omit the section directory. This
+  // describes header availability, not which symbol-table source is usable.
   // A nonzero shoff with shnum=0 uses extended numbering, which this
   // parser does not support; it must not masquerade as a stripped image.
-  const dynamicFallback = e_type === ET_DYN && e_shoff === 0 && e_shnum === 0;
+  const sectionTableAbsent =
+    e_type === ET_DYN && e_shoff === 0 && e_shnum === 0;
   if (
     e_shoff === null ||
-    e_shentsize === null ||
-    e_shnum === null ||
-    (!dynamicFallback && !tableFits(e_shoff, e_shentsize, e_shnum, MIN_SHENT))
+    (!sectionTableAbsent &&
+      !tableFits(e_shoff, e_shentsize, e_shnum, MIN_SHENT))
   )
     return {
       failure: {
@@ -135,8 +138,6 @@ export const readElfHeader = (
   const MIN_PHENT = is64 ? 56 : 32;
   if (
     e_phoff === null ||
-    e_phentsize === null ||
-    e_phnum === null ||
     e_phnum === 0xffff ||
     !tableFits(e_phoff, e_phentsize, e_phnum, MIN_PHENT)
   )
@@ -149,7 +150,7 @@ export const readElfHeader = (
   return {
     header: {
       is64,
-      dynamicFallback,
+      sectionTableAbsent,
       e_shoff,
       e_shentsize,
       e_shnum,
@@ -180,7 +181,7 @@ export const readElfSymbols = async (
   if (parsed.failure !== undefined) return failure(parsed.failure.reason);
   const {
     is64,
-    dynamicFallback,
+    sectionTableAbsent,
     e_shoff,
     e_shentsize,
     e_shnum,
@@ -221,6 +222,7 @@ export const readElfSymbols = async (
   if (segments.length === 0)
     return failure("ELF image has no PT_LOAD segments");
   const tables: {
+    source: "section" | "dynamic-segment";
     offset: number;
     count: number;
     stringOffset: number;
@@ -248,7 +250,7 @@ export const readElfSymbols = async (
       ? undefined
       : "section offset disagrees with its PT_LOAD mapping";
   };
-  if (!dynamicFallback) {
+  if (!sectionTableAbsent) {
     for (let index = 0; index < e_shnum; index += 1) {
       if (index % 4096 === 0) {
         await yieldToEventLoop();
@@ -303,13 +305,18 @@ export const readElfSymbols = async (
       if (stringMapping !== undefined)
         return failure(`Dynamic symbol string table ${stringMapping}`);
       tables.push({
+        source: "section",
         offset,
         count: size / entrySize,
         stringOffset,
         stringSize,
       });
     }
-  } else if (dynamicSegment !== null) {
+  }
+  // A retained section directory may omit SHT_DYNSYM while PT_DYNAMIC still
+  // describes the runtime symbols. A malformed present section already failed
+  // above; it must not be bypassed by an alternative interpretation.
+  if (tables.length === 0 && dynamicSegment !== null) {
     const tags = new Map<number, number>();
     const dynamicEntrySize = is64 ? 16 : 8;
     let terminated = false;
@@ -323,19 +330,29 @@ export const readElfSymbols = async (
         signal?.throwIfAborted();
       }
       const tag = is64 ? reader.u64(base) : reader.u32(base);
-      const value = is64 ? reader.u64(base + 8) : reader.u32(base + 4);
-      if (tag === null || value === null)
-        return failure("Dynamic entry is not representable");
+      if (tag === null) return failure("Dynamic entry is not representable");
+      // ELF defines d_un as ignored for DT_NULL; validate the complete entry
+      // above, but do not interpret a value that has no meaning.
       if (tag === DT_NULL) {
         terminated = true;
         break;
       }
+      // Interpret d_un only for the symbol-table description consumed here.
+      // In particular, DT_SYMBOLIC, DT_TEXTREL and DT_BIND_NOW have ignored
+      // payloads under the ELF ABI; their arbitrary bits are not numeric bounds.
       if (
-        ![DT_SYMTAB, DT_STRTAB, DT_STRSZ, DT_SYMENT, 4, 0x6ffffef5].includes(
-          tag,
-        )
+        ![
+          DT_SYMTAB,
+          DT_STRTAB,
+          DT_STRSZ,
+          DT_SYMENT,
+          DT_HASH,
+          DT_GNU_HASH,
+        ].includes(tag)
       )
         continue;
+      const value = is64 ? reader.u64(base + 8) : reader.u32(base + 4);
+      if (value === null) return failure("Dynamic entry is not representable");
       if (tags.has(tag) && tags.get(tag) !== value)
         return failure("Conflicting dynamic table tags");
       tags.set(tag, value);
@@ -356,8 +373,8 @@ export const readElfSymbols = async (
     // DT_HASH's nchain is the dynsym count. GNU hash instead records the
     // first hashed index and bounded buckets/chains. No payload-to-EOF walk.
     let count: number;
-    const sysv = tags.get(4);
-    const gnu = tags.get(0x6ffffef5);
+    const sysv = tags.get(DT_HASH);
+    const gnu = tags.get(DT_GNU_HASH);
     if (sysv !== undefined) {
       const at = toOffset(sysv, 8);
       if (!at.ok) return failure(`DT_HASH header ${at.error.reason}`);
@@ -418,6 +435,7 @@ export const readElfSymbols = async (
     if (!stringOffset.ok)
       return failure(`Dynamic string table ${stringOffset.error.reason}`);
     tables.push({
+      source: "dynamic-segment",
       offset: offset.value,
       count,
       stringOffset: stringOffset.value,
@@ -436,26 +454,36 @@ export const readElfSymbols = async (
         signal?.throwIfAborted();
       }
       const base = table.offset + index * entrySize;
-      const nameOffset = reader.u32(base)!;
-      const sectionIndex = reader.u16(base + (is64 ? 6 : 14))!;
+      const parsedSymbol = readElfSymbol(
+        bytes.subarray(base, base + entrySize),
+        is64 ? 64 : 32,
+        true,
+      );
+      if (!parsedSymbol.ok) return failure(parsedSymbol.error.message);
+      const symbol = parsedSymbol.value;
+      const nameOffset = symbol.name_offset;
+      const sectionIndex = symbol.section_index;
       const defined =
         sectionIndex === 0xfff1 ||
         (sectionIndex > 0 &&
           sectionIndex < 0xff00 &&
-          (dynamicFallback || sectionIndex < e_shnum));
+          (table.source === "dynamic-segment" || sectionIndex < e_shnum));
       if (!defined || nameOffset >= table.stringSize) continue;
       const name = reader.cString(
         table.stringOffset + nameOffset,
         table.stringOffset + table.stringSize,
       );
       if (name === null || !wanted.has(name)) continue;
-      const value = is64 ? reader.u64(base + 8) : reader.u32(base + 4);
-      const size = is64 ? reader.u64(base + 16) : reader.u32(base + 8);
-      if (value === null || size === null) {
+      if (
+        symbol.value > BigInt(Number.MAX_SAFE_INTEGER) ||
+        symbol.size > BigInt(Number.MAX_SAFE_INTEGER)
+      ) {
         failures.add(`Symbol ${name} has unrepresentable bounds`);
         unresolved.add(name);
         continue;
       }
+      const value = Number(symbol.value);
+      const size = Number(symbol.size);
       const offset = toOffset(value, size);
       if (!offset.ok) {
         failures.add(`Symbol ${name} ${offset.error.reason}`);

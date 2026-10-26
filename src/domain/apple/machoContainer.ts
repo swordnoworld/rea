@@ -12,6 +12,8 @@ export interface FatSliceDeclaration {
   readonly alignmentExponent: number;
   readonly cpuType: number;
   readonly cpuSubtype: number;
+  /** FAT64's raw reserved field; FAT32 has no corresponding field. */
+  readonly reserved: number | null;
 }
 
 export interface FatSliceRangeIssue {
@@ -229,6 +231,28 @@ export const classifyFatContainerIdentity = (
   return { state: "not-mach-o" };
 };
 
+/** Explicit slice observations take precedence over bytes retained in a root prefix. */
+export const classifyFatContainerEvidence = (
+  header: Extract<FatContainerHeader, { readonly state: "parsed" }>,
+  prefix: Uint8Array,
+  sliceHeadersByOffset?: ReadonlyMap<number, MachoHeaderPrefixFacts>,
+): FatContainerIdentity =>
+  classifyFatContainerIdentity(header, (offset) => {
+    if (sliceHeadersByOffset?.has(offset))
+      return sliceHeadersByOffset.get(offset)?.magic;
+    const slice = header.slices.find(
+      (candidate) => candidate.offset === offset,
+    );
+    if (slice === undefined || offset >= prefix.byteLength) return undefined;
+    const available = Math.max(
+      0,
+      Math.min(slice.size, prefix.byteLength - offset, 12),
+    );
+    return readMachoHeaderPrefixFacts(
+      prefix.subarray(offset, offset + available),
+    ).magic;
+  });
+
 /** Decode FAT table entries once so artifact and native readers share identity facts. */
 export const readFatSliceDeclarations = (
   tableBytes: Uint8Array,
@@ -273,9 +297,28 @@ export const readFatSliceDeclarations = (
       alignmentExponent: view.getUint32(base + (wide ? 24 : 16), littleEndian),
       cpuType: view.getUint32(base, littleEndian),
       cpuSubtype: view.getUint32(base + 4, littleEndian),
+      reserved: wide ? view.getUint32(base + 28, littleEndian) : null,
     });
   }
   return { status: "parsed", slices };
+};
+
+/** Find an overlapping pair without changing the declarations' table order. */
+export const findOverlappingFatSlices = (
+  declarations: readonly FatSliceDeclaration[],
+): readonly [FatSliceDeclaration, FatSliceDeclaration] | null => {
+  const ranges = [...declarations].sort((a, b) => a.offset - b.offset);
+  for (let index = 1; index < ranges.length; index++) {
+    const previous = ranges[index - 1];
+    const current = ranges[index];
+    if (
+      previous !== undefined &&
+      current !== undefined &&
+      current.offset < previous.offset + previous.size
+    )
+      return [previous, current];
+  }
+  return null;
 };
 
 /** Validate byte-range and table/header identity facts shared by Mach-O readers. */
