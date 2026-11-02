@@ -1,3 +1,7 @@
+import { readMachoSegmentHeader } from "../../domain/apple/machoSegmentHeader.js";
+import { readMachoSectionHeader } from "../../domain/apple/machoSectionHeader.js";
+import { readElfSectionHeader } from "../../domain/elfSectionHeader.js";
+import { readElfProgramHeader } from "../../domain/elfProgramHeader.js";
 import { readElfRawTableDeclarations } from "../../domain/elfRawTableDeclarations.js";
 import { createHash } from "node:crypto";
 import { parsePeResources } from "../../native/pe/PeResourceParser.js";
@@ -13,12 +17,17 @@ import type { FileHandle } from "node:fs/promises";
 
 import { abortIfNeeded } from "../ArtifactHash.js";
 import { ArtifactReaderFailure } from "../ArtifactReader.js";
-import { readFatContainerHeader } from "../../domain/apple/machoContainer.js";
+import {
+  readFatContainerHeader,
+  readFatHeaderPrefix,
+  readMachoHeaderPrefixFacts,
+} from "../../domain/apple/machoContainer.js";
 import { readElfFixedHeader } from "../../domain/elfFixedHeader.js";
 import { readMachoLoadCommandTableHeader } from "../../domain/apple/machoLoadCommands.js";
 import {
   elfNoteAlignment,
   elfNoteLayout,
+  readElfNoteHeader,
 } from "../../domain/native/elfNoteLayout.js";
 import {
   NODE_SEA_BLOB_TOO_LARGE,
@@ -46,9 +55,6 @@ const MAX_NOTE_NAME_BYTES = 4096;
 const FUSE_LENGTH = "NODE_SEA_FUSE_".length + 32 + 2;
 // PE header structures must fit this prefix for the bounded name probe.
 const PE_HEADER_PROBE_BYTES = 64 * 1024;
-
-const THIN_MAGICS = new Set([0xfeedface, 0xfeedfacf, 0xcefaedfe, 0xcffaedfe]);
-const FAT_MAGICS = new Set([0xcafebabe, 0xcafebabf, 0xbebafeca, 0xbfbafeca]);
 
 /** One injected blob inside a native carrier. Offsets are carrier file offsets. */
 export interface NodeSeaLocation {
@@ -91,11 +97,13 @@ export const locateNodeSea = async (
   const carrier: Carrier = { handle, fileSize, signal };
   const prefix = await readExact(carrier, 0, Math.min(fileSize, 64));
   if (prefix === undefined || prefix.length < 4) return undefined;
-  const magic = prefix.readUInt32BE(0);
-  if (THIN_MAGICS.has(magic) || FAT_MAGICS.has(magic)) {
-    const ranges = THIN_MAGICS.has(magic)
-      ? await locateThinMachO(carrier, 0, fileSize)
-      : await locateFatMachO(carrier, prefix);
+  const thin = readMachoHeaderPrefixFacts(prefix).format;
+  const fat = readFatHeaderPrefix(prefix);
+  if (thin !== null || fat.state === "incomplete" || fat.state === "parsed") {
+    const ranges =
+      thin !== null
+        ? await locateThinMachO(carrier, 0, fileSize)
+        : await locateFatMachO(carrier, prefix);
     return collapseRanges(carrier, "mach-o", ranges);
   }
   if (prefix.subarray(0, 4).equals(Buffer.from([0x7f, 0x45, 0x4c, 0x46])))
@@ -211,7 +219,7 @@ const locateFatMachO = async (
     header = readFatContainerHeader(bytes, carrier.fileSize);
   }
   if (header.state !== "parsed") {
-    if (bytes.length >= 4 && THIN_MAGICS.has(bytes.readUInt32BE(0)))
+    if (readMachoHeaderPrefixFacts(bytes).format !== null)
       return locateThinMachO(carrier, 0, carrier.fileSize);
     return [];
   }
@@ -264,18 +272,23 @@ const locateThinMachO = async (
     }
     if (cmd === LC_SEGMENT || cmd === LC_SEGMENT_64) {
       const segment64 = cmd === LC_SEGMENT_64;
-      const segmentHeader = segment64 ? 72 : 56;
       const sectionSize = segment64 ? 80 : 68;
-      const name = cString(commands, offset + 8, 16);
+      const parsedSegment = readMachoSegmentHeader(
+        commands.subarray(offset, offset + cmdsize),
+        segment64,
+        little,
+      );
+      // Incomplete segments cannot establish a SEA carrier. Interpret names
+      // and section framing only from the shared fixed-record observation.
+      const segment = parsedSegment.ok ? parsedSegment.value : undefined;
+      const name =
+        segment === undefined ? undefined : cString(segment.nameBytes, 0, 16);
       if (
-        (name === "NODE_SEA" || name === "__NODE_SEA") &&
-        cmdsize >= segmentHeader
+        segment !== undefined &&
+        (name === "NODE_SEA" || name === "__NODE_SEA")
       ) {
-        const nsects = readU32(
-          commands,
-          offset + (segment64 ? 64 : 48),
-          little,
-        );
+        const segmentHeader = segment.headerSize;
+        const nsects = segment.sectionCount;
         const table = offset + segmentHeader;
         if (
           nsects > Math.floor((cmdsize - segmentHeader) / sectionSize) ||
@@ -284,17 +297,18 @@ const locateThinMachO = async (
           throw formatFailure(NODE_SEA_MACHO_SEGMENT_TRUNCATED);
         for (let index = 0; index < nsects; index += 1) {
           const section = table + index * sectionSize;
-          if (cString(commands, section, 16) !== SEA_SECTION) continue;
-          const length = segment64
-            ? readU64(commands, section + 40, little)
-            : readU32(commands, section + 36, little);
-          const fileOffset = readU32(
-            commands,
-            section + (segment64 ? 48 : 40),
+          const parsedSection = readMachoSectionHeader(
+            commands.subarray(section, section + sectionSize),
+            segment64,
             little,
           );
-          if (length === undefined) throw limitFailure(NODE_SEA_BLOB_TOO_LARGE);
-          if (length > NODE_SEA_MAX_BLOB_BYTES)
+          if (!parsedSection.ok)
+            throw formatFailure(NODE_SEA_MACHO_SEGMENT_TRUNCATED);
+          const record = parsedSection.value;
+          if (cString(record.nameBytes, 0, 16) !== SEA_SECTION) continue;
+          const length = Number(record.size);
+          const fileOffset = record.offset;
+          if (!Number.isSafeInteger(length) || length > NODE_SEA_MAX_BLOB_BYTES)
             throw limitFailure(NODE_SEA_BLOB_TOO_LARGE);
           if (fileOffset > sliceSize || length > sliceSize - fileOffset)
             throw formatFailure(NODE_SEA_TRUNCATED);
@@ -353,18 +367,28 @@ const locateElfNotes = async (
   if (programs === undefined) opaque = phnum > 0;
   else
     for (const entry of programs) {
-      if (readU32(entry, 0, little) !== PT_NOTE) continue;
-      const note = elf64
-        ? {
-            offset: readU64(entry, 8, little),
-            length: readU64(entry, 32, little),
-            align: readU64(entry, 48, little),
-          }
-        : {
-            offset: readU32(entry, 4, little),
-            length: readU32(entry, 16, little),
-            align: readU32(entry, 28, little),
-          };
+      const parsedProgram = readElfProgramHeader(
+        entry,
+        header.value.elfClass,
+        little,
+      );
+      if (!parsedProgram.ok) continue;
+      const program = parsedProgram.value;
+      if (program.type !== PT_NOTE) continue;
+      const note = {
+        offset:
+          program.offset <= BigInt(Number.MAX_SAFE_INTEGER)
+            ? Number(program.offset)
+            : undefined,
+        length:
+          program.fileSize <= BigInt(Number.MAX_SAFE_INTEGER)
+            ? Number(program.fileSize)
+            : undefined,
+        align:
+          program.alignment <= BigInt(Number.MAX_SAFE_INTEGER)
+            ? Number(program.alignment)
+            : undefined,
+      };
       const scanned = await scanElfNoteTable(
         carrier,
         note,
@@ -391,18 +415,28 @@ const locateElfNotes = async (
   if (sections === undefined) opaque = opaque || shnum > 0;
   else
     for (const entry of sections) {
-      if (readU32(entry, 4, little) !== SHT_NOTE) continue;
-      const note = elf64
-        ? {
-            offset: readU64(entry, 24, little),
-            length: readU64(entry, 32, little),
-            align: readU64(entry, 48, little),
-          }
-        : {
-            offset: readU32(entry, 16, little),
-            length: readU32(entry, 20, little),
-            align: readU32(entry, 32, little),
-          };
+      const parsedSection = readElfSectionHeader(
+        entry,
+        header.value.elfClass,
+        little,
+      );
+      if (!parsedSection.ok) continue;
+      const section = parsedSection.value;
+      if (section.type !== SHT_NOTE) continue;
+      const note = {
+        offset:
+          section.offset <= BigInt(Number.MAX_SAFE_INTEGER)
+            ? Number(section.offset)
+            : undefined,
+        length:
+          section.size <= BigInt(Number.MAX_SAFE_INTEGER)
+            ? Number(section.size)
+            : undefined,
+        align:
+          section.alignment <= BigInt(Number.MAX_SAFE_INTEGER)
+            ? Number(section.alignment)
+            : undefined,
+      };
       const scanned = await scanElfNoteTable(
         carrier,
         note,
@@ -476,8 +510,10 @@ const scanElfNoteTable = async (
     const header = await readExact(carrier, note.offset + cursor, 12);
     if (header === undefined)
       return failNoteTable(alreadyFound || found.length > 0);
-    const namesz = readU32(header, 0, little);
-    const descsz = readU32(header, 4, little);
+    const parsedHeader = readElfNoteHeader(header, little);
+    if (!parsedHeader.ok)
+      return failNoteTable(alreadyFound || found.length > 0);
+    const { namesz, descsz } = parsedHeader.value;
     if (namesz > MAX_NOTE_NAME_BYTES)
       return failNoteTable(alreadyFound || found.length > 0);
     if (cursor > note.length - 12 || namesz > note.length - cursor - 12)
@@ -557,8 +593,9 @@ const locatePeResources = async (carrier: Carrier): Promise<BlobRange[]> => {
   if (bytes === undefined) throw formatFailure(NODE_SEA_TRUNCATED);
   // A native-looking file need not be an admitted PE image. Once the layout
   // is admitted, resource errors remain failures rather than inferred absence.
+  let layout: ReturnType<typeof readPeResourceLayout>;
   try {
-    readPeResourceLayout(bytes);
+    layout = readPeResourceLayout(bytes);
   } catch (cause) {
     if (cause instanceof ArtifactReaderFailure && cause.reason === "format")
       return [];
@@ -577,6 +614,7 @@ const locatePeResources = async (carrier: Carrier): Promise<BlobRange[]> => {
       max_entries: MAX_INSPECT_PE_DIRECTORY_ENTRIES,
     },
     carrier.signal,
+    layout,
   );
   return resources.resources.flatMap((resource) => {
     if (
@@ -654,16 +692,3 @@ const cString = (bytes: Buffer, offset: number, length: number): string => {
 
 const readU32 = (bytes: Buffer, offset: number, little: boolean): number =>
   little ? bytes.readUInt32LE(offset) : bytes.readUInt32BE(offset);
-
-const readU64 = (
-  bytes: Buffer,
-  offset: number,
-  little: boolean,
-): number | undefined => {
-  if (offset < 0 || offset > bytes.length - 8) return undefined;
-  const value = little
-    ? bytes.readBigUInt64LE(offset)
-    : bytes.readBigUInt64BE(offset);
-  if (value > BigInt(Number.MAX_SAFE_INTEGER)) return undefined;
-  return Number(value);
-};

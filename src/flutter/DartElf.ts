@@ -1,3 +1,10 @@
+import {
+  observeElfStringTableEntry,
+  elfStringTableText,
+} from "../domain/elfStringTable.js";
+import { readElfDynamicEntry } from "../domain/elfDynamicEntry.js";
+import { readElfSectionHeader } from "../domain/elfSectionHeader.js";
+import { readElfProgramHeader } from "../domain/elfProgramHeader.js";
 import { readElfSymbol } from "../domain/elfSymbol.js";
 import { readElfRawTableDeclarations } from "../domain/elfRawTableDeclarations.js";
 import { Buffer } from "node:buffer";
@@ -32,14 +39,10 @@ class BoundedReader {
   }
 
   cString(offset: number, tableEnd: number): string | null {
-    if (offset < 0 || offset >= tableEnd || tableEnd > this.bytes.length)
-      return null;
-    const end = this.bytes
-      .subarray(offset, Math.min(tableEnd, offset + 257))
-      .indexOf(0);
-    return end < 0
-      ? null
-      : this.bytes.subarray(offset, offset + end).toString("latin1");
+    if (tableEnd < 0 || tableEnd > this.bytes.length) return null;
+    return elfStringTableText(
+      observeElfStringTableEntry(this.bytes.subarray(0, tableEnd), offset, 257),
+    );
   }
 }
 
@@ -199,15 +202,25 @@ export const readElfSymbols = async (
       signal?.throwIfAborted();
     }
     const base = e_phoff + index * e_phentsize;
-    const type = reader.u32(base);
+    const parsedProgram = readElfProgramHeader(
+      bytes.subarray(base, base + e_phentsize),
+      is64 ? 64 : 32,
+      true,
+    );
+    if (!parsedProgram.ok) return failure(parsedProgram.error.message);
+    const program = parsedProgram.value;
+    const { type } = program;
     if (type !== PT_LOAD && type !== PT_DYNAMIC) continue;
-    const vaddr = is64 ? reader.u64(base + 0x10) : reader.u32(base + 8);
-    const offset = is64 ? reader.u64(base + 8) : reader.u32(base + 4);
-    const filesz = is64 ? reader.u64(base + 0x20) : reader.u32(base + 0x10);
     if (
-      vaddr === null ||
-      offset === null ||
-      filesz === null ||
+      program.virtualAddress > BigInt(Number.MAX_SAFE_INTEGER) ||
+      program.offset > BigInt(Number.MAX_SAFE_INTEGER) ||
+      program.fileSize > BigInt(Number.MAX_SAFE_INTEGER)
+    )
+      return failure(`ELF segment ${String(index)} is not file-backed`);
+    const vaddr = Number(program.virtualAddress);
+    const offset = Number(program.offset);
+    const filesz = Number(program.fileSize);
+    if (
       !Number.isSafeInteger(vaddr + filesz) ||
       offset > bytes.length ||
       filesz > bytes.length - offset
@@ -233,15 +246,13 @@ export const readElfSymbols = async (
    * offset must be the single file interpretation of its address range.
    */
   const sectionMappingFailure = (
-    header: number,
+    section: { readonly flags: bigint; readonly address: bigint },
     offset: number,
     size: number,
   ): string | undefined => {
-    const flags = is64 ? reader.u64(header + 8) : reader.u32(header + 8);
-    const address = is64
-      ? reader.u64(header + 0x10)
-      : reader.u32(header + 0x0c);
-    if (flags === null || address === null)
+    const flags = Number(section.flags);
+    const address = Number(section.address);
+    if (!Number.isSafeInteger(flags) || !Number.isSafeInteger(address))
       return "has an unrepresentable section header";
     if ((flags & SHF_ALLOC) === 0) return undefined;
     const mapped = toOffset(address, size);
@@ -257,48 +268,53 @@ export const readElfSymbols = async (
         signal?.throwIfAborted();
       }
       const header = e_shoff + index * e_shentsize;
-      if (reader.u32(header + 4) !== SHT_DYNSYM) continue;
-      const offset = is64
-        ? reader.u64(header + 0x18)
-        : reader.u32(header + 0x10);
-      const size = is64 ? reader.u64(header + 0x20) : reader.u32(header + 0x14);
-      const width = is64
-        ? reader.u64(header + 0x38)
-        : reader.u32(header + 0x24);
-      const link = reader.u32(header + (is64 ? 0x28 : 0x18));
+      const parsedSection = readElfSectionHeader(
+        bytes.subarray(header, header + e_shentsize),
+        is64 ? 64 : 32,
+        true,
+      );
+      if (!parsedSection.ok) return failure(parsedSection.error.message);
+      const section = parsedSection.value;
+      if (section.type !== SHT_DYNSYM) continue;
+      const offset = Number(section.offset);
+      const size = Number(section.size);
+      const link = section.link;
       if (
-        offset === null ||
-        size === null ||
-        width !== entrySize ||
+        !Number.isSafeInteger(offset) ||
+        !Number.isSafeInteger(size) ||
+        section.entrySize !== BigInt(entrySize) ||
         offset > bytes.length ||
         size > bytes.length - offset ||
         size % entrySize !== 0
       )
         return failure("Dynamic symbol table is malformed");
-      if (link === null || link >= e_shnum)
+      if (link >= e_shnum)
         return failure("Dynamic symbol string section link is invalid");
       const stringHeader = e_shoff + link * e_shentsize;
-      const stringOffset = is64
-        ? reader.u64(stringHeader + 0x18)
-        : reader.u32(stringHeader + 0x10);
-      const stringSize = is64
-        ? reader.u64(stringHeader + 0x20)
-        : reader.u32(stringHeader + 0x14);
+      const parsedStrings = readElfSectionHeader(
+        bytes.subarray(stringHeader, stringHeader + e_shentsize),
+        is64 ? 64 : 32,
+        true,
+      );
+      if (!parsedStrings.ok) return failure(parsedStrings.error.message);
+      const strings = parsedStrings.value;
+      const stringOffset = Number(strings.offset);
+      const stringSize = Number(strings.size);
       if (
-        reader.u32(stringHeader + 4) !== 3 ||
-        stringOffset === null ||
-        stringSize === null ||
+        strings.type !== 3 ||
+        !Number.isSafeInteger(stringOffset) ||
+        !Number.isSafeInteger(stringSize) ||
         stringOffset > bytes.length ||
         stringSize > bytes.length - stringOffset
       )
         return failure(
           "Dynamic symbol strings are out of bounds or not a string table",
         );
-      const symbolMapping = sectionMappingFailure(header, offset, size);
+      const symbolMapping = sectionMappingFailure(section, offset, size);
       if (symbolMapping !== undefined)
         return failure(`Dynamic symbol table ${symbolMapping}`);
       const stringMapping = sectionMappingFailure(
-        stringHeader,
+        strings,
         stringOffset,
         stringSize,
       );
@@ -329,8 +345,17 @@ export const readElfSymbols = async (
         await yieldToEventLoop();
         signal?.throwIfAborted();
       }
-      const tag = is64 ? reader.u64(base) : reader.u32(base);
-      if (tag === null) return failure("Dynamic entry is not representable");
+      const parsedEntry = readElfDynamicEntry(
+        bytes.subarray(base, base + dynamicEntrySize),
+        is64 ? 64 : 32,
+        true,
+      );
+      if (!parsedEntry.ok) return failure(parsedEntry.error.message);
+      // This reader historically admits tag identities as unsigned, safe numbers.
+      const tagBits = BigInt.asUintN(is64 ? 64 : 32, parsedEntry.value.tag);
+      if (tagBits > BigInt(Number.MAX_SAFE_INTEGER))
+        return failure("Dynamic entry is not representable");
+      const tag = Number(tagBits);
       // ELF defines d_un as ignored for DT_NULL; validate the complete entry
       // above, but do not interpret a value that has no meaning.
       if (tag === DT_NULL) {
@@ -351,8 +376,9 @@ export const readElfSymbols = async (
         ].includes(tag)
       )
         continue;
-      const value = is64 ? reader.u64(base + 8) : reader.u32(base + 4);
-      if (value === null) return failure("Dynamic entry is not representable");
+      if (parsedEntry.value.value > BigInt(Number.MAX_SAFE_INTEGER))
+        return failure("Dynamic entry is not representable");
+      const value = Number(parsedEntry.value.value);
       if (tags.has(tag) && tags.get(tag) !== value)
         return failure("Conflicting dynamic table tags");
       tags.set(tag, value);

@@ -25,10 +25,10 @@ import {
   inspectSqliteDatabaseInputSchema,
   sqliteDatabaseSchema,
   type InspectSqliteDatabaseInput,
-  SQLITE_PROVIDER_IDENTITY,
   DEFAULT_SQLITE_WORKER_TIMEOUT_MS,
   sqliteInspectionParameters,
 } from "../domain/sqlite/sqliteDatabase.js";
+import { SQLITE_PROVIDER_IDENTITY } from "../domain/sqlite/SqliteProviderIdentity.js";
 import { analysisInputErrorFromIssues } from "../domain/inputIssueProjection.js";
 import { PrivateRuntimeRoot } from "../process/PrivateRuntimeRoot.js";
 import {
@@ -48,6 +48,7 @@ import { SQLITE_DATABASE_LIMITS } from "./SqliteDatabaseLimits.js";
 
 import {
   executeSqliteDatabaseWorker,
+  sqliteReplyFinalizationFailure,
   type SqliteWorkerLauncher,
 } from "./SqliteDatabaseWorkerExecution.js";
 
@@ -241,7 +242,11 @@ export class SqliteDatabaseProvider implements SqliteDatabasePort {
           new ProviderCleanupError(
             SQLITE_PROVIDER_IDENTITY.id,
             failures.flatMap((failure) => failure.cleanupResources),
-            { failures: failures.map(projectAnalysisError) },
+            {
+              failures: failures.map((failure) =>
+                projectAnalysisError(failure),
+              ),
+            },
             { operation },
           ).bindCleanupDependencies(failures),
         );
@@ -283,7 +288,7 @@ export class SqliteDatabaseProvider implements SqliteDatabasePort {
         options?.signal,
       );
       phase = "worker";
-      const inspection = await executeSqliteDatabaseWorker({
+      const completed = await executeSqliteDatabaseWorker({
         input,
         root: root.path,
         snapshotPath: snapshot.snapshotPath,
@@ -303,18 +308,29 @@ export class SqliteDatabaseProvider implements SqliteDatabasePort {
       const validated = sqliteDatabaseSchema.safeParse({
         artifact: snapshot.artifact,
         wal: snapshot.wal,
-        ...inspection,
+        ...completed.inspection,
         worker_timeout_ms: workerTimeoutMs,
       });
       if (!validated.success)
-        throw new AnalysisOutputError(
-          operation,
-          "SQLite worker report dimensions or identity fields are invalid",
-          retainedOutput === undefined
-            ? undefined
-            : { capturedOutput: retainedOutput },
+        throw sqliteReplyFinalizationFailure(
+          new AnalysisOutputError(
+            operation,
+            "SQLite worker report dimensions or identity fields are invalid",
+            retainedOutput === undefined
+              ? undefined
+              : { capturedOutput: retainedOutput },
+          ),
+          completed.finalization,
         );
-      result = ok(createSqliteObservation(validated.data, input.path));
+      const execution = createSqliteObservation(validated.data, input.path);
+      result =
+        completed.finalization === undefined
+          ? ok(execution)
+          : err(
+              completed.finalization.retainPartialObservation(
+                completedSqliteEvidence(input, execution),
+              ),
+            );
     } catch (cause: unknown) {
       // A failure rethrown after retainCleanup carries no owner of its own;
       // keep the retained worker instead of discarding it.
